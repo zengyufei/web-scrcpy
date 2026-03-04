@@ -7,31 +7,49 @@
     <link href="/static/css/font-awesome.min.css" rel="stylesheet">
     <title>Web server for scrcpy</title>
     <style>
+        /* 使用 dvh（动态视口高度）解决手机浏览器地址栏导致的溢出问题 */
+        html,
         body {
             margin: 0;
+            padding: 0;
             height: 100vh;
+            /* 降级兼容 */
+            height: 100dvh;
+            /* 现代手机浏览器：排除地址栏 */
             display: flex;
             flex-direction: column;
             overflow: hidden;
             background-color: #333;
+            touch-action: none;
+            /* 阻止整页滚动 */
         }
 
         .video-wrapper {
             flex: 1;
             position: relative;
             overflow: hidden;
+            min-height: 0;
+            /* flex 子元素必须加，否则无法收缩 */
         }
 
         video {
             position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            max-width: 100%;
-            max-height: 100%;
-            width: auto;
-            height: auto;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            /* 等比缩放填满容器，GPU 放大，不影响码率 */
             background: black;
+        }
+
+        /* 隐藏浏览器默认媒体控制条 */
+        video::-webkit-media-controls {
+            display: none !important;
+        }
+
+        video::-webkit-media-controls-enclosure {
+            display: none !important;
         }
 
         #status {
@@ -43,6 +61,9 @@
             display: flex;
             gap: 10px;
             width: 100%;
+            flex-shrink: 0;
+            /* 固定高度，不被压缩 */
+            box-sizing: border-box;
         }
 
         .icon {
@@ -77,6 +98,10 @@
         <i id="back-icon" class="fa-solid fa-arrow-left icon"></i>
         <i id="home-icon" class="fa-solid fa-house icon"></i>
         <i id="menu-icon" class="fa-solid fa-bars icon"></i>
+        {% if auth_enabled %}
+        <i id="logout-icon" class="fa-solid fa-right-from-bracket icon" title="退出登录" onclick="location.href='/logout'"
+            style="margin-left:auto;"></i>
+        {% endif %}
     </div>
     <div class="video-wrapper">
         <video id="player" autoplay muted webkit-playsinline playsinline x5-playsinline></video>
@@ -89,25 +114,15 @@
             mode: 'video',
             flushingTime: 0,
             fps: 60,
-            clearBuffer: true,
+            // clearBuffer 已移除：强制清除缓冲会丢弃参考帧，导致解码错误和花屏
+            // maxDelay 设 200ms：超出时 JMuxer 自动丢弃过旧数据，防止延迟无限累积
+            maxDelay: 200,
             onReady: () => {
                 document.getElementById('status').textContent = 'MSE done, waiting for data...';
                 if (videoElement) {
                     videoElement.controls = false;
-                    videoElement.style.cssText = `
-                        -webkit-media-controls: none !important;
-                        -webkit-media-controls-enclosure: none !important;
-                        -webkit-media-controls-panel: none !important;
-                        -webkit-media-controls-play-button: none !important;
-                        -webkit-media-controls-timeline: none !important;
-                        -webkit-media-controls-current-time-display: none !important;
-                        -webkit-media-controls-time-remaining-display: none !important;
-                        -webkit-media-controls-mute-button: none !important;
-                        -webkit-media-controls-volume-slider: none !important;
-                        -webkit-media-controls-fullscreen-button: none !important;
-                        -moz-controls: none !important;
-                        -ms-media-controls: none !important;
-                    `;
+                    // 注意：不使用 cssText 覆盖，避免破坏 max-height / max-width 等布局样式
+                    // 媒体控件已通过 CSS 伪元素选择器统一隐藏
                 }
             },
             onError: (err) => {
@@ -117,7 +132,28 @@
 
         const socket = io({
             reconnection: false,
-            autoConnect: true
+            autoConnect: true,
+            // 强制 WebSocket 直连，跳过 HTTP polling 协商（减少首帧延迟 2-3 个 RTT）
+            transports: ['websocket'],
+            upgrade: false,
+        });
+
+        // 【多人观看】晚入者直接接收配置数据，免去解析二进制头的不可靠风险
+        socket.on('init_data', (data) => {
+            console.log('Received init_data as late viewer');
+            // 伪装 parser 已经验证完 header
+            parser.name = data.name;
+            parser.width = data.width;
+            parser.height = data.height;
+
+            initInput(data.width, data.height);
+
+            // 直接为 JMuxer 提供初始化需要的 SPS、PPS
+            jmuxer.feed({ video: new Uint8Array(data.sps) });
+            jmuxer.feed({ video: new Uint8Array(data.pps) });
+
+            // 关键：丢弃一切流中的中间数据，直到下一个真正的 I-frame (IDR) 到来
+            parser.waitingForIFrame = true;
         });
 
         var input = null;
@@ -135,12 +171,12 @@
             const homeUpIcon = document.getElementById('home-icon');
             const menuUpIcon = document.getElementById('menu-icon');
 
-            powerIcon.addEventListener('mousedown', function () {
-                input.screen_on_off(0);
-            });
-            powerIcon.addEventListener('mouseup', function () {
-                input.screen_on_off(1);
-            });
+            // 电源键：KEYCODE_POWER = 26
+            const fakeEvent = { shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, getModifierState: () => false };
+            powerIcon.addEventListener('mousedown', () => { input.snedKeyCode(fakeEvent, 0, 26); });
+            powerIcon.addEventListener('mouseup', () => { input.snedKeyCode(fakeEvent, 1, 26); });
+            powerIcon.addEventListener('touchstart', (e) => { e.preventDefault(); input.snedKeyCode(fakeEvent, 0, 26); });
+            powerIcon.addEventListener('touchend', (e) => { e.preventDefault(); input.snedKeyCode(fakeEvent, 1, 26); });
 
             volumeDownIcon.addEventListener('mousedown', (event) => {
                 input.snedKeyCode(event, 0, 25);
@@ -162,18 +198,24 @@
             backUpIcon.addEventListener('mouseup', (event) => {
                 input.snedKeyCode(event, 1, 4);
             });
+            backUpIcon.addEventListener('touchstart', (event) => { input.snedKeyCode({ shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, getModifierState: () => false }, 0, 4); });
+            backUpIcon.addEventListener('touchend', (event) => { input.snedKeyCode({ shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, getModifierState: () => false }, 1, 4); });
             homeUpIcon.addEventListener('mousedown', (event) => {
                 input.snedKeyCode(event, 0, 3);
             });
             homeUpIcon.addEventListener('mouseup', (event) => {
                 input.snedKeyCode(event, 1, 3);
             });
+            homeUpIcon.addEventListener('touchstart', (event) => { input.snedKeyCode({ shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, getModifierState: () => false }, 0, 3); });
+            homeUpIcon.addEventListener('touchend', (event) => { input.snedKeyCode({ shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, getModifierState: () => false }, 1, 3); });
             menuUpIcon.addEventListener('mousedown', (event) => {
                 input.snedKeyCode(event, 0, 187);
             });
             menuUpIcon.addEventListener('mouseup', (event) => {
                 input.snedKeyCode(event, 1, 187);
             });
+            menuUpIcon.addEventListener('touchstart', (event) => { input.snedKeyCode({ shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, getModifierState: () => false }, 0, 187); });
+            menuUpIcon.addEventListener('touchend', (event) => { input.snedKeyCode({ shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, getModifierState: () => false }, 1, 187); });
         }
 
         const parser = new VideoParser(({ type, data }) => {
@@ -188,6 +230,14 @@
                 jmuxer.feed({
                     video: data["pps"]
                 });
+                // 【多人观看】如果是首个观看者，将获取到的初始配置回传给服务端
+                socket.emit('set_init_data', {
+                    name: parser.name,
+                    width: data["width"],
+                    height: data["height"],
+                    sps: Array.from(data["sps"]), // 二进制数组转 Array 以便序列化
+                    pps: Array.from(data["pps"])
+                });
             } else if (type === 'screen_size') {
                 initInput(data["width"], data["height"]);
             } else if (type === 'size_change') {
@@ -200,6 +250,24 @@
         socket.on('video_data', (data) => {
             const newData = new Uint8Array(data);
             parser.appendData(newData);
+        });
+
+        // 【多人观看】晚入者直接接收配置数据，免去解析二进制头的不可靠风险
+        socket.on('init_data', (data) => {
+            console.log('Received init_data as late viewer');
+            // 伪装 parser 已经验证完 header
+            parser.name = data.name;
+            parser.width = data.width;
+            parser.height = data.height;
+
+            initInput(data.width, data.height);
+
+            // 直接为 JMuxer 提供初始化需要的 SPS、PPS
+            jmuxer.feed({ video: new Uint8Array(data.sps) });
+            jmuxer.feed({ video: new Uint8Array(data.pps) });
+
+            // 关键：丢弃一切流中的中间数据，直到下一个真正的 I-frame (IDR) 到来
+            parser.waitingForIFrame = true;
         });
 
         socket.on('connect', () => {

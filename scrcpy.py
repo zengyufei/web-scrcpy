@@ -36,7 +36,13 @@ class Scrcpy:
         print("Starting scrcpy server in background...")
         cmd = [
             ADB_PATH, "shell",
-            f"CLASSPATH={DEVICE_SERVER_PATH} app_process / com.genymobile.scrcpy.Server 3.1 tunnel_forward=true log_level=VERBOSE video_bit_rate=" + self.video_bit_rate
+            f"CLASSPATH={DEVICE_SERVER_PATH} app_process / com.genymobile.scrcpy.Server 3.1"
+            f" tunnel_forward=true log_level=INFO"
+            f" video_bit_rate={self.video_bit_rate}"
+            f" video_codec=h264"
+            f" audio=false"
+            f" max_fps={self.max_fps}"
+            + (f" max_size={self.max_size}" if self.max_size > 0 else "")
         ]
         self.android_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         while not self.stop:
@@ -44,7 +50,7 @@ class Scrcpy:
             if not stderr_line:
                 break
             if stderr_line:
-                print(f"Server error: {stderr_line}")
+                print(f"Server: {stderr_line}")
         self.android_process.wait()
         print("Server stopped")
 
@@ -52,7 +58,8 @@ class Scrcpy:
         print("Receiving video data (H.264)...")
         self.video_socket.recv(1)
         while not self.stop:
-            data = self.video_socket.recv(20480)
+            # 256KB 缓冲区：1080p I 帧通常 50-200KB，减少拆包次数
+            data = self.video_socket.recv(262144)
             if not data:
                 break
             self.video_callback(data)
@@ -77,8 +84,10 @@ class Scrcpy:
             print("Control Mesg:", data)
         print("Control connection stopped")
 
-    def scrcpy_start(self, video_callback, video_bit_rate):
+    def scrcpy_start(self, video_callback, video_bit_rate, max_fps=60, max_size=0):
         self.video_bit_rate = video_bit_rate
+        self.max_fps = max_fps
+        self.max_size = max_size  # 0 表示不限制，>0 表示采集端最大边长（px）
         self.video_callback = video_callback
         self.stop = False
 
@@ -99,24 +108,25 @@ class Scrcpy:
 
         # video connection
         self.video_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # TCP_NODELAY: 禁用 Nagle 算法，视频数据立即发送不等待累积
+        self.video_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # SO_RCVBUF: 接收缓冲区对齐 recv() 读取大小（256KB）
+        self.video_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
         self.video_socket.connect(('localhost', LOCAL_PORT))
         print("Video connection established")
 
-        # audio connection
-        self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.audio_socket.connect(('localhost', LOCAL_PORT))
-        print("Audio connection established")
+        # audio=false: scrcpy server 只开放 video + control 两个连接，跳过 audio socket
 
-        # contorl connection
+        # control connection
         self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # TCP_NODELAY: 控制指令必须即时送达，禁用 Nagle 延迟
+        self.control_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.control_socket.connect(('localhost', LOCAL_PORT))
         print("Control connection established")
 
         self.video_thread = Thread(target=self.receive_video_data, daemon=True)
-        self.audio_thread = Thread(target=self.receive_audio_data, daemon=True)
         self.control_thread = Thread(target=self.handle_control_conn, daemon=True)
         self.video_thread.start()
-        self.audio_thread.start()
         self.control_thread.start()
         print("Background tasks started")
 
@@ -137,7 +147,7 @@ class Scrcpy:
                     pass
 
         # Wait for threads to exit, but don't block forever
-        for thread in [self.video_thread, self.audio_thread, self.control_thread]:
+        for thread in [self.video_thread, self.control_thread]:
             if thread:
                 thread.join(timeout=0.5)
 
@@ -151,4 +161,7 @@ class Scrcpy:
         print("Scrcpy stopped")
 
     def scrcpy_send_control(self, data):
-        self.control_socket.send(data)
+        try:
+            self.control_socket.send(data)
+        except Exception as e:
+            print(f"scrcpy_send_control error: {e}")

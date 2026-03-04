@@ -46,7 +46,7 @@ class ScrcpyInput {
                     mouseX = (local_x / (rect.right - rect.left)) * this.width;
                     mouseY = (local_y / (rect.bottom - rect.top)) * this.height;
                 }
-    
+
                 let data = this.createTouchProtocolData(1, mouseX, mouseY, this.width, this.height, 0, 0, 0);
                 this.callback(data);
 
@@ -109,6 +109,59 @@ class ScrcpyInput {
             let data = this.createScrollProtocolData(relativeX, relativeY, width, height, hScroll, vScroll, button);
             this.callback(data);
         });
+
+        // --- Touch events (mobile support) ---
+        const activeTouches = new Map(); // pointerId -> {x, y}
+
+        videoElement.addEventListener('touchstart', (event) => {
+            event.preventDefault();
+            const rect = videoElement.getBoundingClientRect();
+            for (const touch of event.changedTouches) {
+                const local_x = touch.clientX - rect.left;
+                const local_y = touch.clientY - rect.top;
+                const x = (local_x / (rect.right - rect.left)) * this.width;
+                const y = (local_y / (rect.bottom - rect.top)) * this.height;
+                activeTouches.set(touch.identifier, { x, y });
+                let data = this.createTouchProtocolData(0, x, y, this.width, this.height, 0, 0, 65535);
+                this.callback(data);
+            }
+        }, { passive: false });
+
+        videoElement.addEventListener('touchmove', (event) => {
+            event.preventDefault();
+            const rect = videoElement.getBoundingClientRect();
+            for (const touch of event.changedTouches) {
+                const local_x = touch.clientX - rect.left;
+                const local_y = touch.clientY - rect.top;
+                const x = (local_x / (rect.right - rect.left)) * this.width;
+                const y = (local_y / (rect.bottom - rect.top)) * this.height;
+                activeTouches.set(touch.identifier, { x, y });
+                let data = this.createTouchProtocolData(2, x, y, this.width, this.height, 0, 0, 65535);
+                this.callback(data);
+            }
+        }, { passive: false });
+
+        videoElement.addEventListener('touchend', (event) => {
+            event.preventDefault();
+            const rect = videoElement.getBoundingClientRect();
+            for (const touch of event.changedTouches) {
+                const last = activeTouches.get(touch.identifier) || { x: 0, y: 0 };
+                activeTouches.delete(touch.identifier);
+                let data = this.createTouchProtocolData(1, last.x, last.y, this.width, this.height, 0, 0, 0);
+                this.callback(data);
+            }
+        }, { passive: false });
+
+        videoElement.addEventListener('touchcancel', (event) => {
+            event.preventDefault();
+            for (const touch of event.changedTouches) {
+                const last = activeTouches.get(touch.identifier) || { x: 0, y: 0 };
+                activeTouches.delete(touch.identifier);
+                let data = this.createTouchProtocolData(1, last.x, last.y, this.width, this.height, 0, 0, 0);
+                this.callback(data);
+            }
+        }, { passive: false });
+        // --- End touch events ---
 
         videoElement.addEventListener('keydown', async (event) => {
             const androidKeyCode = this.mapToAndroidKeyCode(event);
